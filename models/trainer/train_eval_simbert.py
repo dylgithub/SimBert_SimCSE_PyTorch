@@ -8,29 +8,38 @@ from models.data_utils.simbert_data import get_time_dif
 from transformers import AdamW
 from transformers import get_linear_schedule_with_warmup
 
-
 device = torch.device('cuda' if torch.cuda.is_available() else "cpu")
+
+
 def compute_loss(outputs_cls, outputs_seq, pt_batch):
-    loss_sim,correct_sim = compute_sim_loss(outputs_cls)
-    loss_seq,correct_seq,denominator_seq = compute_seq_loss(outputs_seq,pt_batch)
-    loss = loss_seq+loss_sim
-    return loss,loss_seq,loss_sim,correct_seq,correct_sim,denominator_seq
-def compute_seq_loss(outputs_seq,pt_batch):
+    loss_sim, correct_sim = compute_sim_loss(outputs_cls)
+    loss_seq, correct_seq, denominator_seq = compute_seq_loss(outputs_seq, pt_batch)
+    loss = loss_seq + loss_sim
+    return loss, loss_seq, loss_sim, correct_seq, correct_sim, denominator_seq
+
+
+# 可参考https://spaces.ac.cn/archives/6933理解
+def compute_seq_loss(outputs_seq, pt_batch):
     y_pred = outputs_seq[:, :-1, :]
     y_true = pt_batch['input_ids'][:, 1:]
-    y_mask = pt_batch['token_type_ids'][:, 1:] # segment embedding
-    y_pred = y_pred[y_mask>0,:] # 错位预测,只预测第二句话（即segment_id=1）
-    y_true = y_true[y_mask>0]# 错位预测
-    y_mask = y_mask[y_mask>0]
+    # 这里标记是第几个句子，0代表第一句，1代表第二句，1后面的0代表的是pad部分
+    y_mask = pt_batch['token_type_ids'][:, 1:]  # segment embedding
+    # 选出batch内需要预测token对应的模型输出值
+    # batch的大小是[和下面y_true的长度相等, vocab_size]
+    # 上面的选取和这里的Index，实现了pred和true的错误
+    y_pred = y_pred[y_mask > 0, :]  # 错位预测,只预测第二句话（即segment_id=1）
+    y_true = y_true[y_mask > 0]  # 错位预测
+    y_mask = y_mask[y_mask > 0]
+    # batch内需要预测token的总长度
     denominator_seq = torch.sum(y_mask)
-    loss = F.cross_entropy(y_pred,y_true)
+    loss = F.cross_entropy(y_pred, y_true)
     correct_seq = torch.sum(torch.eq(torch.max(y_pred, dim=1)[1], y_true))
-    return loss,correct_seq,denominator_seq
+    return loss, correct_seq, denominator_seq
 
-
+# 这部分和simcse的Loss相同
 def compute_sim_loss(outputs_cls):
     y_true = get_sim_label(outputs_cls).to(device)
-    y_pred = F.normalize(outputs_cls,p=2,dim=1)
+    y_pred = F.normalize(outputs_cls, p=2, dim=1)
     similarities = torch.mm(y_pred, y_pred.t())
     similarities = similarities - (torch.eye(y_pred.shape[0]) * 1e12).to(device)  # 排除对角线
     similarities = similarities * 30  # scale
@@ -38,26 +47,25 @@ def compute_sim_loss(outputs_cls):
     index = [i for i in range(outputs_cls.shape[0])]
     np.random.shuffle(index)
     y_true = y_true[index]
-    similarities =similarities[index]
-    loss = F.cross_entropy(similarities,y_true)
+    similarities = similarities[index]
+    loss = F.cross_entropy(similarities, y_true)
 
     y_hat = torch.max(similarities, 1)[1]
-    correct_sim = torch.sum(torch.eq(y_hat,y_true))
+    correct_sim = torch.sum(torch.eq(y_hat, y_true))
 
-    return loss,correct_sim
+    return loss, correct_sim
 
 
 def get_sim_label(outputs_cls):
-    idxs = torch.arange(0,outputs_cls.shape[0])
+    idxs = torch.arange(0, outputs_cls.shape[0])
     idxs_2 = (idxs + 1 - idxs % 2 * 2)
     return idxs_2
-
 
 
 def train(args, model, train_loader):
     start_time = time.time()
     model.train()
-    no_decay = ['bias','LayerNorm.bias', 'LayerNorm.weight']
+    no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
          'weight_decay': 0.01},
@@ -76,31 +84,32 @@ def train(args, model, train_loader):
         print('Epoch [{}/{}]'.format(epoch + 1, args.num_epochs))
         for i, trains in enumerate(train_loader):
             improve = ''
-            outputs_cls,outputs_seq,pt_batch = model(trains)
+            outputs_cls, outputs_seq, pt_batch = model(trains)
             model.zero_grad()
-            loss, loss_seq, loss_sim, correct_seq, correct_sim, denominator_seq = compute_loss(outputs_cls,outputs_seq,pt_batch)
+            loss, loss_seq, loss_sim, correct_seq, correct_sim, denominator_seq = compute_loss(outputs_cls, outputs_seq,
+                                                                                               pt_batch)
             loss.backward()
             optimizer.step()
             # scheduler.step()
             loss_now += loss
-            if total_batch % args.save_steps == 0 and total_batch!=0:
+            if total_batch % args.save_steps == 0 and total_batch != 0:
                 # 取前args.save_steps的均值作为模型保存指标
-                if loss_now.item()/args.save_steps < best_loss:
-                    best_loss = loss_now.item()/args.save_steps
+                if loss_now.item() / args.save_steps < best_loss:
+                    best_loss = loss_now.item() / args.save_steps
                     model.bert.save_pretrained(args.save_path)
                     improve = '*'
                 loss_now = 0
             if total_batch % args.report_steps == 0:
                 # 每多少轮输出在训练集和验证集上的效果
                 seq_acc = round(correct_seq.data.item() / denominator_seq.data.item(), 4)
-                sim_acc = round(correct_sim.data.item() / len(trains[0]),4)
+                sim_acc = round(correct_sim.data.item() / len(trains[0]), 4)
                 time_dif = get_time_dif(start_time)
                 msg = 'Iter: {0:>6},  Total Loss: {1:>5.4},  ' \
                       'Seq Loss: {2:>5.4},  Seq Acc: {3:>6.2%},  ' \
                       'Sim Loss: {4:>5.4},  Sim Acc: {5:>6.2%}, Time: {6} {7}'
                 print(msg.format(total_batch, loss.item(),
-                                 loss_seq.item(),seq_acc,
-                                 loss_sim,sim_acc,
+                                 loss_seq.item(), seq_acc,
+                                 loss_sim, sim_acc,
                                  time_dif, improve))
                 model.train()
             total_batch += 1

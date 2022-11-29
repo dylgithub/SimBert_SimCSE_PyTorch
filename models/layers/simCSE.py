@@ -21,11 +21,12 @@ class Model(nn.Module):
 
     def forward(self, x):
         text = x
+        # text 一个批次的数据List
         pt_batch =self.tokenizer(list(text),
                                  padding = True,
                                  truncation = True,
                                  max_length = self.max_len,
                                  return_tensors = "pt").to(self.device)
-
+        # outputs包含last_hidden_state和pooler_output
         outputs = self.bert(**pt_batch,output_hidden_states=False, output_attentions=False)
         return outputs['pooler_output']
